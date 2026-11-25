@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Installateur NumWorks (slot B)</title>
+<style>
+:root{--bg:#fff;--fg:#1b1b1f;--mut:#667;--card:#f2f3f6;--acc:#2f6fed;--bad:#c62828;--ok:#2e7d32;--warn:#fff4d6}
+@media(prefers-color-scheme:dark){:root{--bg:#121316;--fg:#ececf1;--mut:#9aa0ab;--card:#1d1f25;--acc:#6b9bff;--bad:#ff7b7b;--ok:#5fd37a;--warn:#3a3217}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:1.35rem;margin:.2em 0 .6em}
+h2{font-size:1.05rem;margin:0 0 .5em}
+section{background:var(--card);border-radius:12px;padding:14px;margin:0 0 14px}
+.warn{background:var(--warn);border-radius:12px;padding:12px;margin:0 0 14px;font-size:.93rem}
+button{font:inherit;padding:.65em 1em;border:0;border-radius:10px;background:var(--acc);color:#fff;width:100%;margin:.3em 0}
+button.sec{background:transparent;color:var(--acc);border:1px solid var(--acc)}
+button:disabled{opacity:.45}
+select,input[type=file]{font:inherit;width:100%;margin:.3em 0}
+label.chk{display:flex;gap:.6em;align-items:flex-start;margin:.5em 0;font-size:.95rem}
+label.chk input{margin-top:.3em}
+progress{width:100%;height:14px}
+pre{background:#0001;border-radius:8px;padding:8px;font-size:.78rem;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:.5em 0 0}
+.mut{color:var(--mut);font-size:.9rem}
+.bad{color:var(--bad)}.ok{color:var(--ok)}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+</head>
+<body>
+<main>
+<h1>Installateur NumWorks (slot B)</h1>
+<div class="warn">
+<b>À lire.</b> Page non officielle, non testée sur une vraie calculatrice par son auteur. Elle n'écrit que dans le <b>slot B</b> (adresses 0x90400000 à 0x907FFFFF) : toute autre adresse est refusée par le code. Le slot A (système officiel) n'est pas touché. Un Reset au dos ramène la calculatrice sur le système officiel. Utilise <b>Chrome</b>, un câble USB-C/OTG, et ne débranche rien pendant l'écriture.
+</div>
+
+<section>
+<h2>1. Fichiers du thème</h2>
+<div class="mut">Choisis le zip téléchargé depuis GitHub Actions (iOS-OS-Windows ou -Mac, sans le dézipper), ou directement les fichiers du dossier <code>firmware/</code> (.dfu, .elf, games.…bin).</div>
+<input type="file" id="files" multiple>
+<div id="found" class="mut"></div>
+<select id="model" hidden></select>
+</section>
+
+<section>
+<h2>2. Calculatrice</h2>
+<div class="mut">Branche-la, appuie sur <b>Reset</b> au dos, attends le menu officiel.</div>
+<button id="connect">Connecter la calculatrice</button>
+<button id="probe" class="sec" disabled>Test en lecture seule</button>
+<div id="devinfo" class="mut"></div>
+</section>
+
+<section>
+<h2>3. Installer</h2>
+<label class="chk"><input type="checkbox" id="ok"><span>J'ai appuyé sur Reset et la calculatrice affiche le <b>système officiel</b> (pas le thème). La page ne peut pas le vérifier toute seule.</span></label>
+<label class="chk"><input type="checkbox" id="withgames" checked><span>Installer aussi les jeux (si le zip contient un .elf et games.….bin)</span></label>
+<button id="go" disabled>Installer</button>
+<progress id="bar" value="0" max="100" hidden></progress>
+<div id="state" class="mut"></div>
+<pre id="log"></pre>
+</section>
+</main>
+
+<script id="core">
+var SLOT_B_START=0x90400000, SLOT_B_END=0x90800000, USERLAND_B=0x90410000, XFER=2048;
+function hex(n){return '0x'+n.toString(16)}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// Point de passage unique : aucune adresse hors du slot B n'est jamais envoyée.
+function assertSlotB(a,len){
+  len=len||1;
+  if(!(a>=SLOT_B_START && a+len<=SLOT_B_END)) throw new Error('Adresse '+hex(a)+' hors du slot B : refusé');
+}
+
+// "@Nom /0x90000000/1024*004Kg,..." -> segments
+function parseLayout(desc){
+  if(!desc||desc.charAt(0)!=='@') return null;
+  var segs=[], re=/\/\s*(0x[0-9a-fA-F]+)\s*\/\s*([^\/]*)/g, m;
+  while((m=re.exec(desc))){
+    var start=parseInt(m[1],16), secs=[], parts=m[2].split(',');
+    for(var i=0;i<parts.length;i++){
+      var mm=parts[i].trim().match(/^(\d+)\s*\*\s*(\d+)\s*([BKM ]?)\s*([a-gA-G])$/);
+      if(!mm) return null;
+      var mult={'B':1,'K':1024,'M':1048576,'':1,' ':1}[mm[3]];
+      var flag=mm[4].toLowerCase().charCodeAt(0)-96;
+      secs.push({count:+mm[1],size:+mm[2]*mult,erasable:!!(flag&2),writable:!!(flag&4)});
+    }
+    var a=start; secs.forEach(function(s){a+=s.count*s.size});
+    segs.push({start:start,end:a,secs:secs});
+  }
+  return segs.length?segs:null;
+}
+function sectorAt(layout,addr){
+  for(var i=0;i<layout.length;i++){
+    var sg=layout[i]; if(addr<sg.start||addr>=sg.end) continue;
+    var a=sg.start;
+    for(var j=0;j<sg.secs.length;j++){
+      var s=sg.secs[j], e=a+s.count*s.size;
+      if(addr<e){var k=Math.floor((addr-a)/s.size), st=a+k*s.size;
+        return {start:st,end:st+s.size,erasable:s.erasable,writable:s.writable};}
+      a=e;
+    }
+  }
+  return null;
+}
+
+// Fichier DfuSe -> [{addr,data}]
+function parseDfuSe(buf){
+  var v=new DataView(buf), u8=new Uint8Array(buf);
+  function str(p,n){var s='';for(var i=0;i<n;i++)s+=String.fromCharCode(u8[p+i]);return s}
+  if(str(0,5)!=='DfuSe') throw new Error('Ce fichier .dfu n\'est pas au format DfuSe');
+  var targets=v.getUint8(10), p=11, els=[];
+  for(var t=0;t<targets;t++){
+    if(str(p,6)!=='Target') throw new Error('Fichier DfuSe invalide (Target)');
+    var tsize=v.getUint32(p+266,true), n=v.getUint32(p+270,true), q=p+274;
+    for(var e=0;e<n;e++){
+      var addr=v.getUint32(q,true), size=v.getUint32(q+4,true);
+      if(q+8+size>buf.byteLength) throw new Error('Fichier DfuSe tronqué');
+      els.push({addr:addr,data:new Uint8Array(buf,q+8,size)});
+      q+=8+size;
+    }
+    p+=274+tsize;
+  }
+  if(!els.length) throw new Error('Fichier DfuSe vide');
+  return els;
+}
+
+function elfSymbols(buf,names){
+  var v=new DataView(buf), u8=new Uint8Array(buf);
+  if(u8[0]!==0x7f||u8[1]!==0x45||u8[2]!==0x4c||u8[3]!==0x46||u8[4]!==1||u8[5]!==1) throw new Error('ELF32 little-endian attendu');
+  var shoff=v.getUint32(0x20,true), shentsize=v.getUint16(0x2e,true), shnum=v.getUint16(0x30,true);
+  function sh(i){var o=shoff+i*shentsize;return{type:v.getUint32(o+4,true),offset:v.getUint32(o+16,true),size:v.getUint32(o+20,true),link:v.getUint32(o+24,true),entsize:v.getUint32(o+36,true)}}
+  var out={};
+  for(var i=0;i<shnum;i++){
+    var s=sh(i); if(s.type!==2) continue;
+    var str=sh(s.link), es=s.entsize||16, n=Math.floor(s.size/es);
+    for(var k=0;k<n;k++){
+      var o=s.offset+k*es, a=str.offset+v.getUint32(o,true), e=a, name='';
+      while(u8[e]!==0) e++;
+      for(var c=a;c<e;c++) name+=String.fromCharCode(u8[c]);
+      if(names.indexOf(name)>=0) out[name]=v.getUint32(o+4,true);
+    }
+  }
+  names.forEach(function(n){ if(!(n in out)) throw new Error('Symbole '+n+' introuvable dans le .elf') });
+  return out;
+}
+
+function Dfu(dev,intf,layout,onProgress){
+  this.dev=dev;this.intf=intf;this.layout=layout;this.erased={};this.onProgress=onProgress||function(){};
+}
+Dfu.prototype.setup=function(request,value){return {requestType:'class',recipient:'interface',request:request,value:value,index:this.intf}};
+Dfu.prototype.getStatus=async function(){
+  var r=await this.dev.controlTransferIn(this.setup(3,0),6);
+  if(r.status!=='ok'||!r.data||r.data.byteLength<6) throw new Error('GETSTATUS a échoué');
+  var d=r.data;
+  return {status:d.getUint8(0),poll:d.getUint8(1)|(d.getUint8(2)<<8)|(d.getUint8(3)<<16),state:d.getUint8(4)};
+};
+Dfu.prototype.out=async function(request,value,data){
+  var r=(data===undefined)?await this.dev.controlTransferOut(this.setup(request,value)):await this.dev.controlTransferOut(this.setup(request,value),data);
+  if(r.status!=='ok') throw new Error('Transfert refusé ('+r.status+')');
+};
+Dfu.prototype.clearStatus=function(){return this.out(4,0)};
+Dfu.prototype.abort=function(){return this.out(6,0)};
+Dfu.prototype.pollUntil=async function(pred){
+  for(;;){
+    var s=await this.getStatus();
+    if(s.state===10){await this.clearStatus();throw new Error('Erreur DFU (status '+s.status+')')}
+    if(pred(s.state)) return s;
+    await sleep(Math.max(s.poll,1));
+  }
+};
+Dfu.prototype.ensureIdle=async function(){
+  var s=await this.getStatus();
+  if(s.state===10){await this.clearStatus();s=await this.getStatus()}
+  if(s.state===3||s.state===5||s.state===9){await this.abort();s=await this.getStatus()}
+  if(s.state!==2) throw new Error('État DFU inattendu ('+s.state+') : appuie sur Reset puis reconnecte.');
+};
+Dfu.prototype.command=async function(cmd,addr){ // 0x21 = adresse, 0x41 = effacer le secteur
+  assertSlotB(addr);
+  var d=new Uint8Array([cmd,addr&255,(addr>>>8)&255,(addr>>>16)&255,(addr>>>24)&255]);
+  await this.out(1,0,d);
+  var s=await this.pollUntil(function(st){return st!==4});
+  if(s.state!==5) throw new Error('État inattendu après commande ('+s.state+')');
+};
+Dfu.prototype.ensureErased=async function(a,b){
+  var x=a;
+  while(x<b){
+    var s=sectorAt(this.layout,x);
+    if(!s) throw new Error('Adresse '+hex(x)+' absente de la carte mémoire de la calculatrice');
+    if(s.start<SLOT_B_START||s.end>SLOT_B_END) throw new Error('Le secteur '+hex(s.start)+' dépasse du slot B : refusé');
+    if(!s.erasable||!s.writable) throw new Error('Secteur '+hex(s.start)+' non effaçable');
+    if(!this.erased[s.start]){await this.command(0x41,s.start);this.erased[s.start]=1}
+    x=s.end;
+  }
+};
+Dfu.prototype.write=async function(addr,data,label){
+  assertSlotB(addr,data.length);
+  for(var off=0;off<data.length;off+=XFER){
+    var chunk=data.subarray(off,Math.min(off+XFER,data.length)), a=addr+off;
+    await this.ensureErased(a,a+chunk.length);
+    await this.command(0x21,a);
+    await this.out(1,2,chunk);
+    var s=await this.pollUntil(function(st){return st!==4});
+    if(s.state!==5) throw new Error('Écriture refusée à '+hex(a)+' (état '+s.state+')');
+    this.onProgress(label,off+chunk.length,data.length);
+  }
+};
+Dfu.prototype.read=async function(addr,size,label){
+  assertSlotB(addr,size);
+  await this.command(0x21,addr);
+  await this.abort();
+  var out=new Uint8Array(size), off=0, block=2;
+  while(off<size){
+    var want=Math.min(XFER,size-off);
+    var r=await this.dev.controlTransferIn(this.setup(2,block),want);
+    if(r.status!=='ok'||!r.data||r.data.byteLength!==want) throw new Error('Lecture incomplète à '+hex(addr+off));
+    out.set(new Uint8Array(r.data.buffer,r.data.byteOffset,want),off);
+    off+=want;block++;
+    if(label) this.onProgress(label,off,size);
+  }
+  await this.abort();
+  return out;
+};
+Dfu.prototype.verify=async function(addr,data,label){
+  var back=await this.read(addr,data.length,label);
+  for(var i=0;i<data.length;i++) if(back[i]!==data[i]) throw new Error('Différence à '+hex(addr+i)+' à la relecture');
+};
+Dfu.prototype.leave=async function(addr){
+  assertSlotB(addr);
+  await this.command(0x21,addr);
+  await this.out(1,0);
+  try{await this.getStatus();await this.getStatus()}catch(e){/* la calculatrice redémarre */}
+};
+</script>
+
+<script id="ui">
+(function(){
+var $=function(id){return document.getElementById(id)};
+var store={dfu:{},elf:{},games:{}};
+var dev=null, dfu=null, busy=false;
+
+function log(t){var l=$('log');l.textContent+=t+'\n';l.scrollTop=l.scrollHeight}
+function setState(t,cls){var s=$('state');s.textContent=t;s.className=cls||'mut'}
+function refresh(){ $('go').disabled=busy||!dfu||!$('ok').checked||!currentModel(); $('connect').disabled=busy; $('probe').disabled=busy||!dfu; }
+function currentModel(){var s=$('model');return s.hidden?null:s.value}
+
+async function addFile(name,getBuf){
+  var m;
+  if((m=name.match(/\.(n0\d{3})\.B\.dfu$/i))) store.dfu[m[1].toLowerCase()]={name:name,buf:await getBuf()};
+  else if((m=name.match(/\.(n0\d{3})\.B\.elf$/i))) store.elf[m[1].toLowerCase()]={name:name,buf:await getBuf()};
+  else if((m=name.match(/games\.(n0\d{3})\.bin$/i))) store.games[m[1].toLowerCase()]={name:name,buf:await getBuf()};
+}
+async function ingest(file,depth){
+  if(/\.zip$/i.test(file.name)){
+    if(!window.JSZip) throw new Error('Lecture des zip indisponible (pas de connexion ?). Dézippe et choisis les fichiers du dossier firmware/.');
+    var zip=await JSZip.loadAsync(await file.arrayBuffer());
+    var entries=Object.keys(zip.files).map(function(k){return zip.files[k]});
+    for(var i=0;i<entries.length;i++){
+      var e=entries[i]; if(e.dir) continue;
+      if(/\.zip$/i.test(e.name)&&depth<2){
+        var b=await e.async('arraybuffer'); await ingest(new File([b],e.name),depth+1);
+      } else if(/\.(dfu|elf|bin)$/i.test(e.name)){
+        await addFile(e.name,function(){return e.async('arraybuffer')});
+      }
+    }
+  } else await addFile(file.name,function(){return file.arrayBuffer()});
+}
+function render(){
+  var models=Object.keys(store.dfu).sort().reverse(), sel=$('model'), f=$('found');
+  if(!models.length){f.textContent='Aucun firmware (.n0120.B.dfu…) trouvé pour le moment.';sel.hidden=true;refresh();return}
+  var prev=sel.value;
+  sel.innerHTML=''; models.forEach(function(m){var o=document.createElement('option');o.value=m;o.textContent='Modèle '+m.toUpperCase();sel.appendChild(o)});
+  if(models.indexOf(prev)>=0) sel.value=prev; else if(models.indexOf('n0120')>=0) sel.value='n0120';
+  sel.hidden=false;
+  f.innerHTML=models.map(function(m){
+    return m.toUpperCase()+' : '+store.dfu[m].name.split('/').pop()+' ('+Math.round(store.dfu[m].buf.byteLength/1024)+' Ko)'
+      +(store.elf[m]&&store.games[m]?', jeux : '+Math.round(store.games[m].buf.byteLength/1024)+' Ko':', pas de jeux');
+  }).join('<br>');
+  refresh();
+}
+$('files').addEventListener('change',async function(e){
+  setState('Lecture des fichiers…');
+  try{for(var i=0;i<e.target.files.length;i++) await ingest(e.target.files[i],0); setState('')}
+  catch(err){setState(String(err.message||err),'bad')}
+  render();
+});
+$('model').addEventListener('change',refresh);
+$('ok').addEventListener('change',refresh);
+
+function progress(label,done,total){
+  var b=$('bar');b.hidden=false;b.max=total;b.value=done;
+  setState(label+' : '+Math.round(100*done/total)+' %');
+}
+
+async function connect(){
+  if(!navigator.usb) throw new Error('WebUSB indisponible : utilise Chrome (pas Firefox), en HTTPS.');
+  dev=await navigator.usb.requestDevice({filters:[{vendorId:0x0483}]});
+  await dev.open();
+  if(dev.configuration===null) await dev.selectConfiguration(1);
+  var cands=[];
+  dev.configuration.interfaces.forEach(function(i){i.alternates.forEach(function(a){
+    if(a.interfaceClass===0xFE&&a.interfaceSubclass===1) cands.push({i:i.interfaceNumber,a:a.alternateSetting,name:a.interfaceName||'',proto:a.interfaceProtocol});
+  })});
+  $('devinfo').textContent=(dev.productName||'Appareil USB')+' — '+cands.length+' interface(s) DFU';
+  log('Appareil : '+(dev.productName||'?')+' '+hex(dev.vendorId)+':'+hex(dev.productId));
+  cands.forEach(function(c){log('  interface '+c.i+' alt '+c.a+' protocole '+c.proto+' « '+c.name+' »')});
+  var chosen=null,layout=null;
+  for(var k=0;k<cands.length&&!chosen;k++){
+    var l=parseLayout(cands[k].name);
+    if(l&&sectorAt(l,SLOT_B_START)&&sectorAt(l,SLOT_B_END-1)){chosen=cands[k];layout=l}
+  }
+  if(!chosen) throw new Error('Aucune interface DFU ne couvre le slot B (0x90400000). Appareil en mode DFU ? Copie le journal ci-dessous si tu me demandes de l\'aide.');
+  await dev.claimInterface(chosen.i);
+  await dev.selectAlternateInterface(chosen.i,chosen.a);
+  dfu=new Dfu(dev,chosen.i,layout,progress);
+  await dfu.ensureIdle();
+  log('Interface retenue : '+chosen.i+' alt '+chosen.a+' (couvre le slot B)');
+  setState('Connectée.','ok');
+}
+
+$('connect').addEventListener('click',async function(){
+  busy=true;refresh();$('log').textContent='';
+  try{await connect()}catch(err){dfu=null;setState(String(err.message||err),'bad');log('ERREUR : '+(err.message||err))}
+  busy=false;refresh();
+});
+
+$('probe').addEventListener('click',async function(){
+  busy=true;refresh();
+  try{
+    var d=await dfu.read(USERLAND_B,32);
+    log('Lecture à '+hex(USERLAND_B)+' : '+Array.prototype.map.call(d,function(x){return ('0'+x.toString(16)).slice(-2)}).join(' '));
+    setState('Lecture OK : la communication fonctionne.','ok');
+  }catch(err){setState(String(err.message||err),'bad');log('ERREUR : '+(err.message||err))}
+  busy=false;refresh();
+});
+
+async function install(){
+  var m=currentModel(), els=parseDfuSe(store.dfu[m].buf), games=null;
+  dfu.erased={};
+  els.forEach(function(e){assertSlotB(e.addr,e.data.length)});
+  if($('withgames').checked&&store.elf[m]&&store.games[m]&&store.games[m].buf.byteLength>0){
+    var sym=elfSymbols(store.elf[m].buf,['_external_apps_flash_start','_external_apps_flash_end']);
+    var s=sym._external_apps_flash_start,e=sym._external_apps_flash_end,data=new Uint8Array(store.games[m].buf);
+    if(!(SLOT_B_START+0x10000<s&&s<e&&e<=SLOT_B_END)) throw new Error('Zone des jeux incohérente ('+hex(s)+'..'+hex(e)+')');
+    if(data.length>e-s) throw new Error('Trop de jeux : ils ne tiennent pas dans le slot B.');
+    els.forEach(function(x){if(x.addr<s+data.length&&x.addr+x.data.length>s) throw new Error('Les jeux chevauchent le système')});
+    games={addr:s,data:data};
+    log('Jeux : '+hex(s)+' ('+data.length+' octets)');
+  }
+  els.forEach(function(x){log('Système : '+hex(x.addr)+' ('+x.data.length+' octets)')});
+  await dfu.ensureIdle();
+  if(games){
+    await dfu.write(games.addr,games.data,'Écriture des jeux');
+    await dfu.verify(games.addr,games.data,'Vérification des jeux');
+    log('Jeux vérifiés : identiques.');
+  }
+  for(var i=0;i<els.length;i++){
+    await dfu.write(els[i].addr,els[i].data,'Écriture du système');
+    await dfu.verify(els[i].addr,els[i].data,'Vérification du système');
+  }
+  log('Système vérifié : identique.');
+  setState('Démarrage…');
+  await dfu.leave(USERLAND_B);
+  setState('Terminé : la calculatrice redémarre sur le thème. Si l\'écran reste noir, appuie sur Reset.','ok');
+  dfu=null;try{await dev.close()}catch(e){}
+}
+$('go').addEventListener('click',async function(){
+  busy=true;refresh();$('log').textContent='';
+  try{await install()}catch(err){setState('Échec : '+(err.message||err)+' — appuie sur Reset puis reconnecte.','bad');log('ERREUR : '+(err.message||err))}
+  busy=false;refresh();
+});
+if(!navigator.usb) setState('WebUSB indisponible : ouvre cette page dans Chrome, en HTTPS.','bad');
+refresh();
+})();
+</script>
+</body>
+</html>
